@@ -44,9 +44,38 @@ functions and examples without generated code or a library padding helper.
 
 def pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
     """Return `data` with PKCS#7 padding for `block_size` (see the module docstring)."""
-    raise NotImplementedError("Complete the independent padding warmup")
+    #raise NotImplementedError("Complete the independent padding warmup")
+    if block_size < 1 or block_size > 255:
+        raise ValueError("Block Size should be between 1 and 255")
+    cnt = 0
+    for i in range(len(data)):
+        cnt+=1
+    rem = (cnt) % block_size
+    app = 0
+    if rem == 0:
+        app = block_size
+    else: 
+        app = block_size - rem
+    for i in range(app):
+        data += bytes([app])
+    return data
 
 
 def pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
-    """Return `data` with valid PKCS#7 padding removed, or raise ValueError."""
-    raise NotImplementedError("Complete the independent padding warmup")
+    if block_size < 1 or block_size > 255:
+        raise ValueError("Block size should be between 1 and 255")
+    if not data:
+        raise ValueError("Empty input")
+
+    if len(data) % block_size != 0:
+        ValueError("Input is not block-aligned")
+    
+    pad_len = int(data[-1])
+
+    if pad_len < 1 or pad_len > block_size:
+        raise ValueError("Incorrect padding")
+    
+    if data[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("Incorrect padding")
+    
+    return data[:-pad_len]

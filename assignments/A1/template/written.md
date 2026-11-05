@@ -1,9 +1,10 @@
 # Part 5 — Written questions
 
 ## 1. Long keys
-
+Modifying Vigenere to use a single key at least as long as the message can improve security provided there aren't many repeats in the key meaning the key is truly randomized. Otherwise the repeats of the key might have substrings of plaintext encrypted by the same substrings of the key, making it suceptible to Kasiki's method of keylength discovery.
 ## 2. Why IoC works
-
+Taking every kth letter of english text should still preserve the frequency distribution of values for english text. When building cosets, each letter in the coset is encrypted byt he same key letter and so each column is english text encrypted by a ceasar cipher. If the keylength is properly guessed the each coset should preserve the IoC of English text to some degree, and we can choose the highest probably keylength by taking the highest average of all of the cosets in each keylength guess. 
 ## 3. Kasiski vs. IoC
-
+Kasiski's method is centered on looking for repeated fragments in the ciphertext and compliling a list of the distances that seperates the repititions. If a repeated substirng in a plaintext is encrypted by the same substring in the keyword, then the ciphertext should contain a repeated substring and the distance of the occurences is a multiple of the keyword length. Longer ciphertexts should have a higher chance to see more repeated substrings. We take the distances we've found and the factors of each of those distances and take the greatest common divsors for the best guess of the keylength. Kasiski's method thrives for relatively short keys and reused frequently. IoC works when we have enough of the text to sample so large ciphertexts where we cna compare the IoC to English text IoC
 ## 4. IoC as a fitness function (Enigma plugboard)
+I don't really understand this one, I'm sorry.

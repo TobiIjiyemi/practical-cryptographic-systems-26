@@ -70,7 +70,37 @@ Rules that apply everywhere
 * Use the constants and encoders in `jmessage_support.messages` rather than
   writing magic numbers.
 """
+import cryptography
+import secrets
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey, MLKEM768PublicKey
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives import serialization
 
+from cryptography.exceptions import InvalidSignature, InvalidTag
+from hashlib import sha256
+from jmessage_support.messages import (
+    JM1, JM2, PREFERENCE, T_HELLO, T_REPLY, T_DATA,
+    T_FINISH, T_RECEIPT, T_RESEND, T_REJECT, MLKEM_EK_LEN, MLKEM_CT_LEN, encode_hello,
+    encode_reply_core, encode_reject, encode_data, encode_finish, encode_control,
+    parse_hello, parse_reply, parse_finish, parse_data, parse_control,
+    REASON_HYBRID_INVALID, REASON_NO_COMMON_SUITE)
+from jmessage_support.transport import PeerKeyUnavailable
+from jmessage_support import messages
+from jmessage_support.codec import DecodeError, username, u16, u64
+from padding import pkcs7_pad, pkcs7_unpad
+
+def encode_str8(value):
+    raw = value.encode("utf-8")
+
+    if len(raw) > 255:
+        raise ValueError("username is too long for encoding with utf8")
+
+    return bytes([len(raw)]) + raw 
 
 class Client:
     """The handout §3 protocol-core interface. One instance per local account.
@@ -92,6 +122,57 @@ class Client:
     # session per peer, and to queue text for a peer that has no session yet.
     # The state table in §6.9 lists the states and the events each accepts.
 
+    #send all the text queued in pending_text_by_peer AFTER handshake has been established
+    def _flush_pending_text(self, peer):
+        queued = self.pending_text_by_peer.pop(peer, [])
+        for text in queued:
+            self.send_text(peer, text)
+
+    def derive_session_keys(
+            self,
+            suite, #(Jm1, jm2)
+            dh, #diffie helman exchange
+            ss_pq, #shared secret
+            initiator,
+            responder,
+            hello_bytes,
+            reply_bytes
+        ):
+        ikm = None
+        length = None
+        if suite == JM1:
+            ikm = dh
+            length = 96
+        elif suite == JM2:
+            ikm = ss_pq + dh
+            length = 64
+        else:
+            raise ValueError("unsupported suite")
+    
+        th = sha256(b"JMessage-2026 keys" + encode_str8(initiator) + encode_str8(responder) + hello_bytes + reply_bytes).digest()
+        #using sha256 as the key derivation function, using the transcript hash as the salt, the suite and Jmessage-2026 as the info and length depending on the suite,
+        #derivte the output keying material giving the input keymaterial  
+        okm = HKDF(
+            algorithm = hashes.SHA256(),
+            salt = th,
+            info = b"JMessage-2026 " + u16(suite),
+            length = length
+        ).derive(ikm)
+
+
+        #k_ir, k_ri, enc_ir, mac_ir, enc_ri, mac_ri: first two are for JM2, key for the initiator to the responder and then key for the responder to the initiator
+        #next 4 are JM1: encryption and mac keys for the initiator to the responder, and vice versa
+        if suite == JM2:
+            return {
+                "k_ir": okm[:32],
+                "k_ri": okm[32:64]
+            }
+        return {
+            "enc_ir": okm[:16],
+            "mac_ir": okm[16:48],
+            "enc_ri": okm[48:64],
+            "mac_ri": okm[64:96]
+        }
     def __init__(self, username, identity_private_key, lookup_peer_key, emit, now,
                  *, jm1_only=False):
         """Store the handout §3 constructor arguments and create empty state.
@@ -125,6 +206,11 @@ class Client:
         self.emit = emit
         self.now = now
         self.jm1_only = jm1_only
+
+        self.sessions_by_sid = {}
+        self.latest_session_by_peer = {}
+        self.pending_text_by_peer = {}
+        self.retired_sids = set()
         # TODO: Design your handshake and session state. See specification §6.9.
 
     # ----- 2. Fingerprint (§5) -----------------------------------------------
@@ -135,7 +221,7 @@ class Client:
 
     def fingerprint(self, peer=None):
         """Return the §5 display string for self, or a named peer.
-
+        
         Implements spec §5: the fingerprint of a user is derived from that
         user's raw 32-byte public key idPK and shown as ten uppercase hex
         pairs separated by single spaces.
@@ -156,7 +242,25 @@ class Client:
             No state has changed and nothing has been emitted. Displaying a
             fingerprint does not authenticate it (§5).
         """
-        raise NotImplementedError("Implement fingerprint in protocol.py")
+        fingerprint_b = None
+        if peer is None:
+            private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+                self.identity_private_key
+            )
+            public_key = private_key.public_key()
+            local_pub_key = public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            digest = sha256(b"JMessage-2026 fingerprint" + local_pub_key).digest()
+            fingerprint_b = digest[:10]
+        else:
+            peer_key = self.lookup_peer_key(peer)
+            digest = sha256(b"JMessage-2026 fingerprint" + peer_key).digest()
+            fingerprint_b = digest[:10]
+
+        fingerprint = " ".join(f"{byte:02X}" for byte in fingerprint_b)
+        return fingerprint
 
     # ----- 3. Handshake as initiator (§§6.3, 6.5, 6.6, 6.8) ------------------
     # Review-critical (AGENTS.md "What counts as explained": rows "Transcript &
@@ -174,6 +278,96 @@ class Client:
     # signature, §6.8).
 
     def start_handshake(self, peer):
+
+        #peer's Ed25519 public identity key 
+
+        try:
+            peer_identity_key = self.lookup_peer_key(peer)
+        except:
+        #if lookup key isn't available then send an error,
+            self.emit({
+                "type": "error",
+                "peer": peer, 
+                "message": "Peer Key couldn't be found"
+            })
+            return
+
+
+        #define list of suites to use,
+        #check if those are objects or those are supposed to be strings
+        if self.jm1_only:
+            suites = (JM1,)
+        else:
+            suites = (JM2, JM1)
+
+
+        #generate random 16 byte sid. something cryptographically secure and random.
+        #research other ways to generate sids but token_bytes works for nwo
+        generated_sid = secrets.token_bytes(messages.SID_LEN)
+
+        #to ensure we dont' reuse a current or previous generated sid
+        while generated_sid in self.sessions_by_sid.keys() or generated_sid in self.retired_sids:
+            generated_sid = secrets.token_bytes(messages.SID_LEN)
+        
+        #generating keypair with cryptograhpy library       
+        x_private = X25519PrivateKey.generate()
+        X_I = x_private.public_key()
+
+        raw_public_x = X_I.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        mlkem_priv, raw_mlkem_pub = None, b""
+        if JM2 in suites:
+            mlkem_priv = MLKEM768PrivateKey.generate()
+            ek_I = mlkem_priv.public_key()
+            raw_mlkem_pub = ek_I.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+
+        #build the hello bytes: sid, suites, x_public, ek
+        hello_bytes = encode_hello(
+            generated_sid, suites, raw_public_x, raw_mlkem_pub
+        )
+
+        session_entry = {
+            "sid": generated_sid,
+            "peer": peer,
+            "role": "initiator",
+            "state": "pending-reply",
+            "suites": suites,
+            "hello_bytes": hello_bytes,
+            "peer_identity_key": peer_identity_key,
+            "x_private": x_private,
+            "mlkem_private": mlkem_priv,
+            "start_time": self.now(),
+            "fallback_used": False,
+            "send_seq": 0,
+            "recv_seq": 0,
+            "key": None,
+            #per session bookkeeping
+            #maps sequence numbers to DATA , resend has to transmit original bytes
+            "sent_records": {},
+            #prevents duplicate RECEIPT events (next two combined help stop replay attacks maybe?)
+            "received_receipts": set(),
+            #limits automatic resending to once per sequence number
+            "resend_counts": {},
+        }
+        
+        self.sessions_by_sid[generated_sid] = session_entry
+
+        #sending the HELLO bytes
+        self.emit({
+            "type": "send",
+            "to": peer,
+            "body": hello_bytes,
+        })
+
+        #is emit a function to send stuf over? do I call emit with "HELLO" in bytes? 
+        #generate_sid -> involving some random generation. add to pending_reply mapping?
+        # are we sending a key over start_handshake?
         """Begin a fresh handshake (§6), even if another session exists.
 
         Implements spec §6.3 (HELLO), with the offer rules of §6.1 and the key
@@ -197,7 +391,6 @@ class Client:
             when `jm1_only` is set (§6.1); ek_I is present exactly when JM2 is
             offered (§6.3). Any existing sessions with `peer` are unaffected.
         """
-        raise NotImplementedError("Implement start_handshake in protocol.py")
 
     # ----- 4. Handshake as responder (§§6.2, 6.4, 6.5, 6.6) ------------------
     # Review-critical (AGENTS.md "What counts as explained": rows "Transcript &
@@ -253,7 +446,790 @@ class Client:
             Exactly the state change the §6.9 table allows for this message in
             the current state, or none at all.
         """
-        raise NotImplementedError("Implement receive in protocol.py")
+
+        #validation
+        
+        #Make sure to catch TypeError and ValueError, so they don't silently discard
+        try:
+            username(sender)
+            username(recipient)
+        except (TypeError, ValueError):
+            return
+
+        if recipient != self.username:
+            return
+        
+        #if body isn't in bytes or body isn't empty at all, as opposed to just if not body
+        if not isinstance(body, bytes) or not body:
+            return
+        
+        if body[0] == T_HELLO:
+            #parse hello_bytes in body, catch DecodeError
+            try:
+                hello = parse_hello(body)
+            except DecodeError:
+                return
+
+            #save hello_bytes exactly as it was received
+            hello_bytes = body
+
+            #define inititator and responder usernames
+            initiator = sender
+            responder = self.username
+
+            #define helper function to format reject_bytes body 
+            #with the proper structured data and key generation for signing
+            def send_reject(reason):
+                reason_bytes = bytes([reason])
+                reject_signed_data = (
+                    b"JMessage-2026 reject"
+                    + hello.sid
+                    + reason_bytes
+                    + encode_str8(sender)
+                )
+
+                ipk = ed25519.Ed25519PrivateKey.from_private_bytes(
+                    self.identity_private_key
+                )
+
+                reject_signature = ipk.sign(reject_signed_data)
+
+                reject_bytes = encode_reject(
+                    hello.sid,
+                    reason,
+                    reject_signature
+                )
+
+                self.retired_sids.add(hello.sid)
+
+                self.emit({
+                    "type": "send",
+                    "to": sender,
+                    "body": reject_bytes
+                })
+
+
+            #if extracted sid already in use or in retired_sids then silently discard and return
+            if hello.sid in self.sessions_by_sid.keys() or hello.sid in self.retired_sids:
+                return
+
+            #try suites in order of preference and keep first one that's in hello.suites
+            suite = None
+            for candidate in PREFERENCE:
+                if candidate in hello.suites:
+                    suite = candidate
+                    break
+            
+            #send an error if no suite was chosen
+            if suite is None:
+                send_reject(REASON_NO_COMMON_SUITE)
+                return
+            
+            if suite == JM2 and len(hello.ek) != MLKEM_EK_LEN:
+                #if mlkem public key bytes has incorrect length then fail and stop processing
+                send_reject(REASON_HYBRID_INVALID)
+                return
+            
+            try:
+                initiator_identity_key = self.lookup_peer_key(sender)
+            except PeerKeyUnavailable:
+                self.retired_sids.add(hello.sid)
+                self.emit({
+                    "type": "error",
+                    "peer": sender,
+                    "message": "Peer identity key is unavailable",
+                })
+                return
+            
+            #generating repsonder key pairs
+            x_priv = X25519PrivateKey.generate()
+            x_pub = x_priv.public_key()
+            x_pub_raw = x_pub.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+
+            dh = None
+            #complete diffie hellman exchange or throw error for invalid X25519
+            try:
+                #need to serialize initiator public key bytes into proper public key object
+                initiator_x_pub = X25519PublicKey.from_public_bytes(hello.x_pub)
+                dh = x_priv.exchange(initiator_x_pub)
+            except ValueError:
+                self.retired_sids.add(hello.sid)
+                self.emit({
+                    "type": "error",
+                    "peer": sender,
+                    "message": "Invalid X25519 public key",
+                })
+                return
+
+            #ss_pq is a MLKEM shared secret/keyschedule
+            ss_pq = b""
+            ciphertext = b""
+
+            if suite == JM2:
+                try:
+                    #take initiator public bytes and serialize to get initiator public key object
+                    initiator_ek = MLKEM768PublicKey.from_public_bytes(hello.ek)
+                    #encapsulate and generate shared secret and ciphertext
+                    ss_pq, ciphertext = initiator_ek.encapsulate()
+                except (ValueError, TypeError):
+                    send_reject(REASON_HYBRID_INVALID)
+                    return
+            
+            reply_core = encode_reply_core(
+                hello.sid,
+                suite,
+                x_pub_raw,
+                ciphertext
+            )
+
+            th_r = sha256(
+                b"JMessage-2026 TH-R"
+                + encode_str8(sender)
+                + encode_str8(self.username)
+                + hello_bytes
+                + reply_core
+            ).digest()
+
+            identity_private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+                self.identity_private_key
+            )
+
+            reply_signature = identity_private_key.sign(
+                b"JMessage-2026 responder" + th_r
+            )
+
+            reply_bytes = reply_core + reply_signature
+            
+            keys = self.derive_session_keys(
+                suite=suite, 
+                dh=dh, 
+                ss_pq=ss_pq, 
+                initiator=initiator, 
+                responder=responder,
+                hello_bytes=hello_bytes,
+                reply_bytes=reply_bytes
+            )
+            #create session_entry
+            session_entry = {
+                "sid": hello.sid,
+                "peer": sender,
+                "role": "responder",
+                "state": "pending-finish",
+                "suite": suite,
+                "hello_bytes": hello_bytes,
+                "reply_bytes": reply_bytes,
+                "peer_identity_key": initiator_identity_key,
+                "x_private": x_priv,
+                "dh": dh,
+                "ss_pq": ss_pq,
+                "send_seq": 0,
+                "recv_seq": 0,
+                "start_time": self.now(),
+                "fallback_used": False,
+                "keys": keys,
+                "sent_records": {},
+                "received_receipts": set(),
+                "resend_counts": {},
+            }
+
+            self.sessions_by_sid[hello.sid] = session_entry
+
+            self.emit({
+                "type": "send",
+                "to": sender,
+                "body": reply_bytes,
+            })
+        elif body[0] == T_REPLY:
+            try:
+                reply = parse_reply(body)
+            except DecodeError:
+                return
+            
+            session = self.sessions_by_sid.get(reply.sid)
+            if session is None:
+                return
+            
+            if (
+                session["state"] != "pending-reply" 
+                or session["role"] != "initiator" 
+                or session["peer"] != sender
+            ):
+                return
+        
+            suite = reply.suite
+
+            if suite not in session["suites"]:
+                self.sessions_by_sid.pop(reply.sid, None)
+                return
+            
+            if suite == JM2:
+                if len(reply.ct) != MLKEM_CT_LEN:
+                    self.sessions_by_sid.pop(reply.sid, None)
+                    return
+            elif suite == JM1:
+                #should be no ciphertext in reply if JM1
+                if reply.ct:
+                    self.sessions_by_sid.pop(reply.sid, None)
+                    return
+            else:
+                #if no suite then terminate session
+                self.sessions_by_sid.pop(reply.sid, None)
+                return
+            
+            th_r = sha256(b"JMessage-2026 TH-R" + encode_str8(self.username) + encode_str8(sender) + session["hello_bytes"] + reply.core).digest()
+
+            #verify the reply signature with peer_identity_key and prefix + transcript responder hash.
+            try:
+                peer_public_key = ed25519.Ed25519PublicKey.from_public_bytes(
+                    session["peer_identity_key"]
+                )
+                peer_public_key.verify(
+                    reply.sig,
+                    b"JMessage-2026 responder" + th_r,
+                )
+            #Catch ValueError, TypeError, AND InvalidSignature
+            except (ValueError, TypeError, InvalidSignature):
+                self.sessions_by_sid.pop(reply.sid, None)
+                return
+            
+            x_private = session["x_private"]
+
+            #diffie hellman exchange with self private key from the session and reply public key
+            try:
+                responder_x_pub = X25519PublicKey.from_public_bytes(reply.x_pub)
+                dh = x_private.exchange(responder_x_pub)
+            except ValueError:
+                self.sessions_by_sid.pop(reply.sid, None)
+                return
+            
+            ss_pq = b""
+
+            if suite == JM2:
+                mlkem_private = session["mlkem_private"]
+                try:
+                    ss_pq = mlkem_private.decapsulate(reply.ct)
+                except (ValueError, TypeError):
+                    self.sessions_by_sid.pop(reply.sid, None)
+                    return
+            
+            reply_bytes = body
+            keys = self.derive_session_keys(
+                suite= suite,
+                dh = dh,
+                ss_pq = ss_pq,
+                initiator = self.username,
+                responder = sender,
+                hello_bytes = session["hello_bytes"],
+                reply_bytes = reply_bytes,
+            )
+
+            session.update({
+                "suite": suite,
+                "reply_bytes": reply_bytes,
+                "dh": dh,
+                "ss_pq": ss_pq,
+                "keys": keys
+            })
+
+            th_i = sha256(
+                b"JMessage-2026 TH-I" + encode_str8(self.username) + encode_str8(sender) + session["hello_bytes"] + reply_bytes).digest()
+            
+            identity_private_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+                self.identity_private_key
+            )
+
+            finish_signature = identity_private_key.sign(
+                b"JMessage-2026 initiator" + th_i
+            )
+
+            finish_bytes = encode_finish(
+                reply.sid,
+                finish_signature,
+            )
+
+            self.emit({
+                "type": "send",
+                "to": sender,
+                "body": finish_bytes,
+            })
+
+            session["state"] = "established"
+            self.latest_session_by_peer[sender] = reply.sid
+            
+
+            self.emit({
+                "type": "established",
+                "peer": sender,
+                "sid": reply.sid,
+                "suite": suite,
+            })
+            self._flush_pending_text(sender)
+        elif body[0] == T_FINISH:
+            try:
+                finish = parse_finish(body)
+            except DecodeError:
+                return
+
+            session = self.sessions_by_sid.get(finish.sid)
+            if session is None:
+                return
+            
+            if (
+                session["state"] != "pending-finish"
+                or session["role"] != "responder"
+                or session["peer"] != sender
+            ): 
+                return
+
+            #recompute stored transcript hash from the initiator to verify
+            th_i = sha256(
+                b"JMessage-2026 TH-I"
+                + encode_str8(sender)
+                + encode_str8(self.username)
+                + session["hello_bytes"]
+                + session["reply_bytes"]
+            ).digest()
+
+
+            try:
+                initiator_public_key = (
+                    ed25519.Ed25519PublicKey.from_public_bytes(
+                        session["peer_identity_key"]
+                    )
+                )
+
+                #compare parse signature and computed signature to make sure initiator matches
+                initiator_public_key.verify(
+                    finish.sig,
+                    b"JMessage-2026 initiator" + th_i,
+                )
+            except (ValueError, TypeError, InvalidSignature):
+                self.sessions_by_sid.pop(finish.sid, None)
+                self.retired_sids.add(finish.sid)
+                return
+            
+            #after validating finish signature, move session state to established
+            session["state"] = "established"
+            self.latest_session_by_peer[sender] = finish.sid
+
+            self.emit({
+                "type": "established",
+                "peer": sender,
+                "sid": finish.sid,
+                "suite": session["suite"],
+            })
+            self._flush_pending_text(sender)
+        elif body[0] == T_REJECT:
+            #same flow as always, try to parse reject and put in reject object
+            try:
+                reject = messages.parse_reject(body)
+            except DecodeError:
+                return
+
+            #if session isn't valid through state, role, or peer then silently discard
+            session = self.sessions_by_sid.get(reject.sid)
+            if (
+                session is None
+                or session["state"] != "pending-reply"
+                or session["role"] != "initiator"
+                or session["peer"] != sender
+            ):
+                return
+
+            #verify reject signature with peer identity key and compute signed with sid, reason, and sender. 
+            try:
+                peer_public_key = ed25519.Ed25519PublicKey.from_public_bytes(
+                    session["peer_identity_key"]
+                )
+                signed = (
+                    b"JMessage-2026 reject"
+                    + reject.sid
+                    + bytes([reject.reason])
+                    + encode_str8(sender)
+                )
+                peer_public_key.verify(reject.sig, signed)
+            except (ValueError, TypeError, InvalidSignature):
+                # forged reject shouldn't end a pending handshake.
+                #so people can't tamper by just stalling connections
+                return
+
+            #if valid reject then pop sid from current sessions and retire that sid
+            old_sid = reject.sid
+            self.sessions_by_sid.pop(old_sid, None)
+            self.retired_sids.add(old_sid)
+
+            #emit the reason for the rejection
+            if reject.reason != REASON_HYBRID_INVALID:
+                self.emit({
+                    "type": "error",
+                    "peer": sender,
+                    "message": "Peer rejected the handshake",
+                })
+                return
+
+            if session.get("fallback_used") or JM2 not in session.get("suites", ()):
+                self.emit({
+                    "type": "error",
+                    "peer": sender,
+                    "message": "JM1 fallback already used",
+                })
+                return
+
+            #generate random fallback_sid, ensure that it isn't already in use or already retired.
+            fallback_sid = secrets.token_bytes(messages.SID_LEN)
+            while (
+                fallback_sid in self.sessions_by_sid
+                or fallback_sid in self.retired_sids
+            ):
+                fallback_sid = secrets.token_bytes(messages.SID_LEN)
+
+            #generate fallback keypairs and public helo bytes.
+            fallback_private = X25519PrivateKey.generate()
+            fallback_public = fallback_private.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            fallback_hello = encode_hello(
+                fallback_sid,
+                (JM1,),
+                fallback_public,
+                b"",
+            )
+
+            #send a session downgrading the suite to just JM1 and restart with a fallback hello
+            self.sessions_by_sid[fallback_sid] = {
+                "sid": fallback_sid,
+                "peer": sender,
+                "role": "initiator",
+                "state": "pending-reply",
+                "suites": (JM1,),
+                "hello_bytes": fallback_hello,
+                "peer_identity_key": session["peer_identity_key"],
+                "x_private": fallback_private,
+                "mlkem_private": None,
+                "start_time": self.now(),
+                "fallback_used": True,
+                "send_seq": 0,
+                "recv_seq": 0,
+                "key": None,
+                "sent_records": {},
+                "received_receipts": set(),
+                "resend_counts": {},
+            }
+            self.emit({
+                "type": "send",
+                "to": sender,
+                "body": fallback_hello,
+            })
+        elif body[0] == T_DATA:
+            #parse the body with the parse_data function (same start as always)
+            try:
+                data = parse_data(body)
+            except DecodeError:
+                return
+            
+            #get session by sid
+            session = self.sessions_by_sid.get(data.sid)
+            if session is None:
+                return
+            
+            #if the session isn't established or the stored peer doesn't equal the sender
+            #do not accept that data
+            if (
+                session["state"] != "established"
+                or session["peer"] != sender
+            ):
+                return
+            
+            if data.seq != session["recv_seq"]:
+                return
+            
+            #control break, work on implementing receiving data if suite is JM2 first
+            if session["suite"] == JM2:
+                if len(data.protected) < 16:
+                    return
+                
+                #depending on the direction, grab the corresponding key
+                if session["role"] == "initiator":
+                    direction = "ri"
+                else:
+                    direction = "ir"
+                
+                key = session["keys"][f"k_{direction}"]
+                
+                #compose nonce and associated data
+                nonce = b"\x00\x00\x00\x00" + u64(data.seq)
+                aad = data.sid + u64(data.seq)
+
+                #decrypt with AESGCM given the key, nonce, encrypted data, and associated data
+                try:
+                    plaintext = AESGCM(key).decrypt(
+                        nonce,
+                        data.protected,
+                        aad,
+                    )
+                except InvalidTag:
+                    #resend body back if there's an invalid tag?
+                    resend_body = encode_control(
+                        T_RESEND,
+                        data.sid,
+                        data.seq,
+                    )
+
+                    self.emit({
+                        "type": "send",
+                        "to": sender,
+                        "body": resend_body
+                    })
+                    return
+                
+                #after data has been properly received then increment received_sequence by 1
+                #to match the ses_seq
+                session["recv_seq"] = data.seq + 1
+
+                receipt_body = encode_control(
+                    T_RECEIPT,
+                    data.sid,
+                    data.seq,
+                )
+                self.emit({
+                    "type": "send",
+                    "to": sender,
+                    "body": receipt_body,
+                })
+
+                try:
+                    text = plaintext.decode("utf-8")
+                except UnicodeDecodeError:
+                    self.emit({
+                        "type": "error",
+                        "peer": sender,
+                        "message": "Authenticated DATA is not valid UTF-8",
+                    })
+                    return
+
+                if len(plaintext) > 4096:
+                    self.emit({
+                        "type": "error",
+                        "peer": sender,
+                        "message": "Authenticated DATA exceeds maximum length of 4096 bytes",
+                    })
+                    return
+                
+                self.emit({
+                    "type": "message",
+                    "peer": sender,
+                    "sid": data.sid,
+                    "seq": data.seq,
+                    "text": text,
+                })
+                return
+            elif session["suite"] == JM1:
+                #if the only data is the tag which is 32 bytes long or it's not block aligned reject!
+                if (
+                    len(data.protected) < 32
+                    or len(data.protected) % 16 != 0
+                ): 
+                    return
+                
+                if session["role"] == "initiator":
+                    direction = "ri"
+                else:
+                    direction = "ir"
+                
+                enc_key = session["keys"][f"enc_{direction}"]
+                mac_key = session["keys"][f"mac_{direction}"]
+
+                iv = data.protected[:16]
+                ciphertext = data.protected[16:]
+
+                padded = None
+                try:
+                    decryptor = Cipher(
+                        algorithms.AES(enc_key),
+                        modes.CBC(iv),
+                    ).decryptor()
+
+                    padded = decryptor.update(ciphertext) + decryptor.finalize()
+                except ValueError:
+                    resend_body = encode_control(
+                        T_RESEND,
+                        data.sid,
+                        data.seq,
+                    )
+                    self.emit({
+                        "type": "send",
+                        "to": sender,
+                        "body": resend_body,
+                    })
+                    return
+
+                try:
+                    unpadded = pkcs7_unpad(padded, 16)
+                except ValueError:
+                    return
+                
+                if len(unpadded) < 32:
+                    resend_body = encode_control(
+                        T_RESEND,
+                        data.sid,
+                        data.seq,
+                    )
+                    self.emit({
+                        "type": "send",
+                        "to": sender,
+                        "body": resend_body,
+                    })
+                    return
+                
+                #split the plaintext and received MAC
+                plaintext = unpadded[:-32]
+                received_mac = unpadded[-32:]
+
+                mac_input = data.sid + u64(data.seq) + plaintext
+
+                verifier = hmac.HMAC(
+                    mac_key,
+                    hashes.SHA256(),
+                )
+
+                verifier.update(mac_input)
+                #compute mac tag given the data.sid, data.seq and plaintext decrypted
+                expected_mac = verifier.finalize()
+
+                #compare received mac and computed mac to see if they match
+                if not secrets.compare_digest(received_mac, expected_mac):
+                    resend_body = encode_control(
+                        T_RESEND,
+                        data.sid,
+                        data.seq,
+                    )
+                    self.emit({
+                        "type": "send",
+                        "to": sender,
+                        "body": resend_body,
+                    })
+                    return
+                
+                session["recv_seq"] = data.seq + 1
+
+                receipt_body = encode_control(
+                    T_RECEIPT,
+                    data.sid,
+                    data.seq,
+                )
+
+                self.emit({
+                    "type": "send",
+                    "to": sender,
+                    "body": receipt_body
+                })
+                
+                try:
+                    text = plaintext.decode("utf-8")
+                except UnicodeDecodeError:
+                    self.emit({
+                        "type": "error",
+                        "peer": sender,
+                        "message": "Authenticated DATA is not valid UTF-8",
+                    })
+                    return
+                
+                if len(plaintext) > 4096:
+                    self.emit({
+                        "type": "error",
+                        "peer": sender,
+                        "message": (
+                            "Aunthenticated DATA exceeds maximum length of 4096 bytes "
+                        ),
+                    })
+                    return
+                
+                self.emit({
+                    "type": "message",
+                    "peer": sender,
+                    "sid": data.sid,
+                    "seq": data.seq,
+                    "text": text,
+                })
+                return
+
+
+        elif body[0] in (T_RECEIPT, T_RESEND):
+            try:
+                control = parse_control(body)
+            except DecodeError:
+                return
+            
+            session = self.sessions_by_sid.get(control.sid)
+            if session is None:
+                return
+
+            if (
+                session["state"] != "established"
+                or session["peer"] != sender
+            ):
+                return
+            
+            #control message sequence number out of the range of previously stored sequence numbers
+            if control.seq >= session["send_seq"]:
+                return
+            
+            if control.kind == T_RECEIPT:
+                #if receipt has already been received then quit
+                if control.seq in session["received_receipts"]:
+                    return
+                
+                session["received_receipts"].add(control.seq)
+
+                self.emit({
+                    "type": "receipt",
+                    "peer": sender,
+                    "sid": control.sid,
+                    "seq": control.seq,
+                })
+                return
+
+            if control.kind == T_RESEND:
+                resend_count = session["resend_counts"].get(control.seq, 0)
+
+                #prevents multiple resends of the same sequence number
+                if resend_count >= 1:
+                    self.emit({
+                        "type": "warning",
+                        "peer": sender,
+                        "message": (
+                            f"Not resending sequence {control.seq} more than once"
+                        ),
+                    })
+                    return
+
+                cached_body = session["sent_records"].get(control.seq)
+                if cached_body is None:
+                    self.emit({
+                        "type": "warning",
+                        "peer": sender,
+                        "message": (
+                            f"No cached DATA record for sequence {control.seq}"
+                        )
+                    })
+                    return
+                
+                self.emit({
+                    "type": "send",
+                    "to": sender,
+                    "body": cached_body,
+                })
+
+                session["resend_counts"][control.seq] = resend_count + 1
+                return            
+
+
+        
+
 
     # ----- 5. Key schedule (§6.7) ---------------------------------------------
     # Review-critical (AGENTS.md "What counts as explained": row "Key
@@ -312,7 +1288,161 @@ class Client:
             * Otherwise the text is queued for `peer`, to be sent on whichever
               session with that peer is established first (§6.9).
         """
-        raise NotImplementedError("Implement send_text in protocol.py")
+
+        #encode text with utf-8 catch encode error and emit an error message
+        try:
+            plaintext = text.encode("utf-8")
+        except UnicodeEncodeError:
+            self.emit({
+                "type": "error",
+                "peer": peer,
+                "message": "Text is not valid UTF-8",
+            })
+            return
+        
+        if len(plaintext) > 4096:
+            self.emit({
+                "type": "error",
+                "peer": peer,
+                "message": "Text exceeds the required length of 4096 bytes" 
+            })
+            return
+        
+        #retrieved the sid of latest used session
+        sid = self.latest_session_by_peer.get(peer)
+
+        #access the session through that sid
+        session = self.sessions_by_sid.get(sid) if sid is not None else None
+
+        if session is None or session["state"] != "established":
+            #queue structure for text to be sent; list of strings contained in the queue
+            self.pending_text_by_peer.setdefault(peer, []).append(text)
+
+            #grab any sessions that has "peer" equal to peer, state in "pending-reply" or "pending-finish"
+            #and save that to "has_pending_handshake"
+            has_pending_handshake = any(
+                entry["peer"] == peer 
+                and entry["state"] in ("pending-reply", "pending-finish")
+                for entry in self.sessions_by_sid.values()
+            )
+
+            if not has_pending_handshake:
+                self.start_handshake(peer)
+            
+            return
+        
+        #grab sequence number from the session
+        seq = session["send_seq"]
+
+        #before we increment, check to make sure it hasn't reached the limit 2^64 - 1
+        if seq >= 2**64 - 1:
+            self.emit({
+                "type": "error",
+                "peer": peer,
+                "message": "Send sequence exhausted"
+            })
+        
+        if session["role"] == "initiator":
+            direction = "ir"
+        else:
+            direction = "ri"
+        
+        key, enc_key, mac_key = None, None, None
+        
+        if session["suite"] == JM2:
+            key = session["keys"][f"k_{direction}"]
+        else:
+            enc_key = session["keys"][f"enc_{direction}"]
+            mac_key = session["keys"][f"mac_{direction}"]
+        
+        if session["suite"] == JM2:
+            #nonce is 12 bytes long
+            nonce = b"\x00\x00\x00\x00" + u64(seq)
+
+            #define associated data with sid and sequence number
+            aad = sid + u64(seq)
+            
+            #create encryption object with post quantum safe key
+            aesgcm = AESGCM(key)
+            #encrypted with nonce, plaintext, and aad
+            protected = aesgcm.encrypt(
+                nonce,
+                plaintext,
+                aad,
+            )
+            data_body = encode_data(
+                sid,
+                seq,
+                protected,
+            )
+
+            self.emit({
+                "type": "send",
+                "to": peer,
+                "body": data_body,
+            })
+
+            #map the sequence number to data_body that was sent, in case of RESEND; making sure to cache AFTER successful emit
+            session["sent_records"][seq] = data_body
+
+            #only increment send seq after UT8-validation, verified established session
+            #exists, and after encryption succeeds,
+            session["send_seq"] = seq + 1
+        elif session["suite"] == JM1:
+
+            #create mac_input with sid + sequence number and plaintext
+            mac_input = sid + u64(seq) + plaintext
+
+            #setup hmac function with key and sha256 hashing algorithmn 
+            mac = hmac.HMAC(
+                mac_key,
+                hashes.SHA256(),
+            )
+
+            #createa  tag with hmac function and mac_input. function set up with key with input (sid + seq# + plaintext) = tag
+            mac.update(mac_input)
+            tag = mac.finalize()
+
+            #pad plaintext and tag together
+            padded = pkcs7_pad(plaintext + tag, 16)
+
+            #generate random iv bits
+            iv = secrets.token_bytes(16)
+            #set up AES cipher with the encryption key and CBC mode with a randomized Initialization vector
+            encryptor = Cipher(
+                #not even using AESGCM, just plain AES with CBC??? definitely vulnerable to some kinda attack
+                algorithms.AES(enc_key),
+                modes.CBC(iv),
+            ).encryptor()
+
+            #encrypt padded material (plaintext + tag)
+            ciphertext = encryptor.update(padded) + encryptor.finalize()
+
+            #append the same random iv? to the ciphertext and then encode/encrypt that with sid, seq#, and protected
+            protected = iv + ciphertext
+
+            data_body = encode_data(
+                sid,
+                seq,
+                protected,
+            )
+
+            self.emit({
+                "type": "send",
+                "to": peer,
+                "body": data_body,
+            })
+
+            session["sent_records"][seq] = data_body
+            session["send_seq"] = seq + 1
+            return
+
+
+
+
+
+
+        return
 
     # ----- 7. Control messages (§7.3) -------------------------------------------
     # Part of AGENTS.md "What counts as explained", row "Record receive".
