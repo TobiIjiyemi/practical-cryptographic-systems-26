@@ -1,0 +1,49 @@
+{
+  "kit_api_version": 1,
+  "run_id": "ca82ced19ad6dd20f7a4fb24ddc21966",
+  "part": "3",
+  "mode": "record",
+  "elapsed_seconds": 10.57,
+  "time_limit_seconds": 300,
+  "counts": {
+    "deliveries": 11043,
+    "requests": 11046,
+    "pending_messages": 103
+  },
+  "limit_hit": null,
+  "sandbox_error": null,
+  "verdicts": {
+    "recovery": "pass"
+  },
+  "sid": null,
+  "plaintext_hex": "684774715a3345756e33745a4c61797849354d6b38715346644e4b423161644b6a30647138383933355335707865436a4246",
+  "blocks": [
+    {
+      "index": 0,
+      "plaintext_hex": "684774715a3345756e33745a4c617978"
+    },
+    {
+      "index": 1,
+      "plaintext_hex": "49354d6b38715346644e4b423161644b"
+    },
+    {
+      "index": 2,
+      "plaintext_hex": "6a30647138383933355335707865436a"
+    },
+    {
+      "index": 3,
+      "plaintext_hex": "4246d16b5344b38cb1f52fe6684d2201"
+    },
+    {
+      "index": 4,
+      "plaintext_hex": "0dd7e2cf2b916f426c9817692fd7bcf5"
+    },
+    {
+      "index": 5,
+      "plaintext_hex": "a47e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
+    }
+  ],
+  "worker_status": "ok",
+  "worker_error": null,
+  "note": "local development runner; grading uses OS-isolated workers and independent block comparison (KIT-SPEC \u00a712.1)."
+}

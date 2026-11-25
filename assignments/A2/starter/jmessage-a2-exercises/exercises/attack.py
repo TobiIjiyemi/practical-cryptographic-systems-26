@@ -84,7 +84,7 @@ def downgrade(api) -> bytes:
 
     #downgrade failed
     if retry_parse["suites"] != [0x0001]:
-        raise RuntimeError(f"fallback HELLO offers more than just JM1: {retry_parse["suites"]}")
+        raise RuntimeError(f"fallback HELLO offers more than just JM1: {retry_parse['suites']}")
     if retry_parse["ek_len"] != 0:
         raise RuntimeError("Fallback HELLO has non-empty ek_I")
     
@@ -102,7 +102,7 @@ def downgrade(api) -> bytes:
 
     #final check to make sure downgrade didn't fail
     if not neg or neg["suite"] != 1:
-        raise RuntimeError(f"no Jm1 session establisehd: {st["negotiation"]}")
+        raise RuntimeError(f"no Jm1 session establisehd: {st['negotiation']}")
     return neg["sid"]
 
 
@@ -186,9 +186,18 @@ def recover(api, target) -> dict:
                 #oracle examines last plaintext block.
                 #feed forged followed by C_j so D(C_j) XOR forged is last.
                 if probe(api, sid, seq, bytes(forged) + C_j):
+                    if pos == 15:
+                        trial = bytearray(forged)
+                        trial[14] ^= 0x01 # change a byte that would be in paddign length >= 2
+                        if probe(api, sid, seq, bytes(trial) + C_j):
+                            found = guess
+                            break
+                        else:
+                            continue
+                    else:
                     # padding is valid. we've found the guess that makes guess ^ C_j[pos] = pad_val
-                    found = guess
-                    break
+                        found = guess
+                        break
             if found is None:
                 raise RuntimeError(f"no valid byte at block {j} pos {pos}")
             

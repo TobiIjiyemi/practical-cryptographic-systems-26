@@ -1,0 +1,24 @@
+{
+  "kit_api_version": 1,
+  "run_id": "ecc95f1e819dfc7ec54af17b60ea6938",
+  "part": "2",
+  "mode": "negotiation",
+  "elapsed_seconds": 0.057,
+  "time_limit_seconds": 60,
+  "counts": {
+    "deliveries": 5,
+    "requests": 10,
+    "pending_messages": 1
+  },
+  "limit_hit": null,
+  "sandbox_error": null,
+  "verdicts": {
+    "negotiation": "pass"
+  },
+  "sid": "31e06ac295ee251f0f0b44f21be2d9b6",
+  "plaintext_hex": null,
+  "blocks": [],
+  "worker_status": "ok",
+  "worker_error": null,
+  "note": "local development runner; grading uses OS-isolated workers and independent block comparison (KIT-SPEC \u00a712.1)."
+}
